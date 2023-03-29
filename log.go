@@ -21,8 +21,21 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
+// raftLog 由以下成员组成：
+//
+//	- storage Storage：持久化存储 —— 存放已经持久化数据的 Storage 接口。
+//	- unstable unstable：非持久化存储 —— 用于保存应用层还没有持久化的数据。
+//	- committed uint64：保存当前提交的日志数据索引。
+//	- applied uint64：保存当前传入状态机的数据最高索引。
+//
+// 一条日志数据，首先需要被提交（committed）成功，然后才能被应用（applied）到状态机中。
+// 因此，以下不等式一直成立：applied <= committed。
 type raftLog struct {
 	// storage contains all stable entries since the last snapshot.
+	//
+	// 之前以为是 storage 表示“协商一致的提案”，unstable表示“协商中的提案”，然后后者协商一致后，挪到前者。
+	// 然而我错了，storage 如字面意思，就是存储的，已经落地了，但是目前只有一个实现 MemoryStorage，也是搞笑
+	// unstable 表示不稳定的，在内存里的数据
 	storage Storage
 
 	// unstable contains all unstable entries and snapshot.
@@ -31,20 +44,29 @@ type raftLog struct {
 
 	// committed is the highest log position that is known to be in
 	// stable storage on a quorum of nodes.
+	//
+	// 已提交
 	committed uint64
+
 	// applying is the highest log position that the application has
 	// been instructed to apply to its state machine. Some of these
 	// entries may be in the process of applying and have not yet
 	// reached applied.
 	// Use: The field is incremented when accepting a Ready struct.
 	// Invariant: applied <= applying && applying <= committed
+	//
+	// 正在应用
 	applying uint64
+
+
 	// applied is the highest log position that the application has
 	// successfully applied to its state machine.
 	// Use: The field is incremented when advancing after the committed
 	// entries in a Ready struct have been applied (either synchronously
 	// or asynchronously).
 	// Invariant: applied <= committed
+	//
+	// 已应用
 	applied uint64
 
 	logger Logger
@@ -53,13 +75,16 @@ type raftLog struct {
 	// returned from calls to nextCommittedEnts that have not been acknowledged
 	// by a call to appliedTo.
 	maxApplyingEntsSize entryEncodingSize
+
 	// applyingEntsSize is the current outstanding byte size of the messages
 	// returned from calls to nextCommittedEnts that have not been acknowledged
 	// by a call to appliedTo.
 	applyingEntsSize entryEncodingSize
+
 	// applyingEntsPaused is true when entry application has been paused until
 	// enough progress is acknowledged.
 	applyingEntsPaused bool
+
 }
 
 // newLog returns log using the given storage and default options. It
@@ -75,11 +100,15 @@ func newLogWithSize(storage Storage, logger Logger, maxApplyingEntsSize entryEnc
 	if storage == nil {
 		log.Panic("storage must not be nil")
 	}
+
+	// 创建 raftLog 实例，并初始化 storage 字段
 	log := &raftLog{
 		storage:             storage,
 		logger:              logger,
 		maxApplyingEntsSize: maxApplyingEntsSize,
 	}
+
+	// 获取 storage 中第一和最后一个 Entry 的索引
 	firstIndex, err := storage.FirstIndex()
 	if err != nil {
 		panic(err) // TODO(bdarnell)
@@ -88,13 +117,21 @@ func newLogWithSize(storage Storage, logger Logger, maxApplyingEntsSize entryEnc
 	if err != nil {
 		panic(err) // TODO(bdarnell)
 	}
+
+	// offset 从持久化之后的最后一个 index 的下一个开始
 	log.unstable.offset = lastIndex + 1
 	log.unstable.offsetInProgress = lastIndex + 1
 	log.unstable.logger = logger
+
 	// Initialize our committed and applied pointers to the time of the last compaction.
+	// committed 和 applied 从持久化的第一个 index 的上一个位置，因为在 firstIndex 之前的数据既然已经是持久化数据了，说明都是已经被提交成功的数据了。
 	log.committed = firstIndex - 1
 	log.applying = firstIndex - 1
 	log.applied = firstIndex - 1
+
+	// [重要]
+	// 从这里的代码分析可以看出，raftLog 的两部分，持久化存储和非持久化存储，它们之间的分界线就是 lastIndex ，
+	// 在此之前都是 Storage 管理的已经持久化的数据，而在此之后都是 unstable 管理的还没有持久化的数据。
 
 	return log
 }
@@ -129,12 +166,17 @@ func (l *raftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry
 }
 
 func (l *raftLog) append(ents ...pb.Entry) uint64 {
+	// 为空，返回当前最后的 index
 	if len(ents) == 0 {
 		return l.lastIndex()
 	}
+
+	//
 	if after := ents[0].Index - 1; after < l.committed {
 		l.logger.Panicf("after(%d) is out of range [committed(%d)]", after, l.committed)
 	}
+
+	//
 	l.unstable.truncateAndAppend(ents)
 	return l.lastIndex()
 }
@@ -305,13 +347,16 @@ func (l *raftLog) firstIndex() uint64 {
 }
 
 func (l *raftLog) lastIndex() uint64 {
+
 	if i, ok := l.unstable.maybeLastIndex(); ok {
 		return i
 	}
+
 	i, err := l.storage.LastIndex()
 	if err != nil {
 		panic(err) // TODO(bdarnell)
 	}
+
 	return i
 }
 
@@ -452,6 +497,7 @@ func (l *raftLog) maybeCommit(maxIndex, term uint64) bool {
 		l.commitTo(maxIndex)
 		return true
 	}
+
 	return false
 }
 

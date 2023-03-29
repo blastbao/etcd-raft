@@ -27,8 +27,17 @@ import (
 // NB(tbg): Progress is basically a state machine whose transitions are mostly
 // strewn around `*raft.raft`. Additionally, some fields are only used when in a
 // certain State. All of this isn't ideal.
+//
+// Leader 通过 Progress 这个数据结构来追踪一个 follower 的状态，并根据 Progress 里的信息来决定每次同步的日志项。
+//
 type Progress struct {
+	// 用来保存当前 follower 节点的日志状态：
+	//	Match：保存目前为止，已复制给该 follower 的日志的最高索引值。如果 leader 对该 follower 上的日志情况一无所知的话，这个值被设为 0 。
+	//	Next：保存下一次 leader 发送 append 消息给该 follower 的日志索引，即下一次复制日志时，leader 会从 Next 开始发送日志。
+	//
+	// 在正常情况下，Next = Match + 1，也就是下一个要同步的日志应当是对方已有日志的下一条。
 	Match, Next uint64
+
 	// State defines how the leader should interact with the follower.
 	//
 	// When in StateProbe, leader sends at most one replication message
@@ -40,6 +49,9 @@ type Progress struct {
 	//
 	// When in StateSnapshot, leader should have sent out snapshot
 	// before and stops sending any replication message.
+	//
+	// State 属性用来保存该节点当前的同步状态:
+
 	State StateType
 
 	// PendingSnapshot is used in StateSnapshot.
@@ -75,6 +87,10 @@ type Progress struct {
 	// When a leader receives a reply, the previous inflights should
 	// be freed by calling inflights.FreeLE with the index of the last
 	// received entry.
+	//
+	// 流量控制，因为如果同步请求非常多，再碰上网络分区时，leader 可能会累积很多待发送消息，
+	// 一旦网络恢复，可能会有非常大流量发送给follower，所以这里要做 flow control 。
+	// 它的实现有点类似 TCP 的滑动窗口，这里不再赘述。
 	Inflights *Inflights
 
 	// IsLearner is true if this progress is tracked for a learner.

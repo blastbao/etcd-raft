@@ -139,11 +139,13 @@ func (rn *RawNode) Ready() Ready {
 func (rn *RawNode) readyWithoutAccept() Ready {
 	r := rn.raft
 
+
 	rd := Ready{
 		Entries:          r.raftLog.nextUnstableEnts(),
 		CommittedEntries: r.raftLog.nextCommittedEnts(rn.applyUnstableEntries()),
 		Messages:         r.msgs,
 	}
+
 	if softSt := r.softState(); !softSt.equal(rn.prevSoftSt) {
 		// Allocate only when SoftState changes.
 		escapingSoftSt := softSt

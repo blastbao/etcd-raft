@@ -130,9 +130,13 @@ func IsEmptySnap(sp pb.Snapshot) bool {
 
 // Node represents a node in a raft cluster.
 type Node interface {
+
 	// Tick increments the internal logical clock for the Node by a single tick. Election
 	// timeouts and heartbeat timeouts are in units of ticks.
+	//
+	// 逻辑时钟
 	Tick()
+
 	// Campaign causes the Node to transition to candidate state and start campaigning to become leader.
 	Campaign(ctx context.Context) error
 	// Propose proposes that data be appended to the log. Note that proposals can be lost without
@@ -325,6 +329,7 @@ func (n *node) run() {
 	lead := None
 
 	for {
+
 		if advancec == nil && n.rn.HasReady() {
 			// Populate a Ready. Note that this Ready is not guaranteed to
 			// actually be handled. We will arm readyc, but there's no guarantee
@@ -429,6 +434,8 @@ func (n *node) run() {
 
 // Tick increments the internal logical clock for this Node. Election timeouts
 // and heartbeat timeouts are in units of ticks.
+//
+//
 func (n *node) Tick() {
 	select {
 	case n.tickc <- struct{}{}:

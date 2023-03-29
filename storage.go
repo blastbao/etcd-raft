@@ -43,6 +43,8 @@ var ErrSnapshotTemporarilyUnavailable = errors.New("snapshot is temporarily unav
 // If any Storage method returns an error, the raft instance will
 // become inoperable and refuse to participate in elections; the
 // application is responsible for cleanup and recovery in this case.
+//
+// 存储层接口
 type Storage interface {
 	// TODO(tbg): split this into two interfaces, LogStorage and StateStorage.
 
@@ -83,11 +85,18 @@ type MemoryStorage struct {
 	// goroutine.
 	sync.Mutex
 
+	// 当前 raft 状态机的状态
 	hardState pb.HardState
+
+	// 数据快照
 	snapshot  pb.Snapshot
+
 	// ents[i] has raft log position i+snapshot.Metadata.Index
+	//
+	// 日志条目
 	ents []pb.Entry
 
+	//
 	callStats inMemStorageCallStats
 }
 

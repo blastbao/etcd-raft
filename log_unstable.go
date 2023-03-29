@@ -30,12 +30,29 @@ import pb "go.etcd.io/raft/v3/raftpb"
 // Note that unstable.offset may be less than the highest log
 // position in storage; this means that the next write to storage
 // might need to truncate the log before persisting unstable.entries.
+//
+//
+// unstable 数据结构用于还没有被用户层持久化的数据，它维护了两部分内容 snapshot 和 entries 。
+//
+// entries 代表的是要进行操作的日志，但日志不可能无限增长，在特定的情况下，某些过期的日志会被清空。
+// 那这就引入一个新问题了，如果此后一个新的 follower 加入，而 leader 只有一部分操作日志，那这个新 follower 不是没法同步了吗？
+//
+// 所以这个时候 snapshot 就登场了 - 我无法给你之前的日志，但我给你所有之前日志应用后的结果，
+// 之后的日志你再以这个 snapshot 为基础进行应用，那我们的状态就可以同步了。
+//
+// 所以，unstable 的前半部分是快照数据，后半部分是日志条目组成的数组entries；
+// 另外， unstable.offset 成员保存的是 entries 数组中的第一条数据在 raft 日志中的索引，即第 i 条 entry 在 raft 日志中的索引为 i + unstable.offset。
 type unstable struct {
 	// the incoming unstable snapshot, if any.
+	// 快照数据，该快照数据也是未写入 Storage 中的 Entry 记录
 	snapshot *pb.Snapshot
+
 	// all entries that have not yet been written to storage.
+	// 所有未被保存到 Storage 中的 Entry 记录
 	entries []pb.Entry
+
 	// entries[i] has raft log position i+offset.
+	// entries 中第一条记录的索引值newLogWithSize
 	offset uint64
 
 	// if true, snapshot is being written to storage.

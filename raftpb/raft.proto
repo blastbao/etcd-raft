@@ -19,9 +19,13 @@ enum EntryType {
 }
 
 message Entry {
+	//期号: 当前的选举轮次
 	optional uint64     Term  = 2 [(gogoproto.nullable) = false]; // must be 64-bit aligned for atomic operations
+	//标号: 每一条提案都有一个Index，递增，可以理解为ID
 	optional uint64     Index = 3 [(gogoproto.nullable) = false]; // must be 64-bit aligned for atomic operations
+	//类型: 普通提案 或 配置变更提案
 	optional EntryType  Type  = 1 [(gogoproto.nullable) = false];
+	//数据
 	optional bytes      Data  = 4;
 }
 
@@ -31,8 +35,14 @@ message SnapshotMetadata {
 	optional uint64    term       = 3 [(gogoproto.nullable) = false];
 }
 
+// 服务会不定期地将 `已协商一致的提案(日志)` 打包压缩成一个 `数据快照` 。
+// 比如 put(a,1) put(a,2) put(b,3) 会打包成数据快照 a:2;b:3
+// 正常情况下，节点启动会从本地读取数据快照，然后在此基础上继续同步提案(日志);
+// 同步提案的过程中，如果有异常，则会将先同步 Leader 的最新数据快照给 Follower，然后再此数据快照的基础上，再继续同步提案。
 message Snapshot {
+	// 被打包压缩的数据，数据格式由具体的应用层提供
 	optional bytes            data     = 1;
+	// 该份数据对应的 raft 状态机的状态，包括 Nodes、Index、Item
 	optional SnapshotMetadata metadata = 2 [(gogoproto.nullable) = false];
 }
 
@@ -67,6 +77,17 @@ enum MessageType {
 	// raft/util_test.go.
 }
 
+// 字段说明：
+//	To, From：分别代表了这个消息的接受者和发送者。
+//	Term：这个消息发出时整个集群所处的任期。
+//	LogTerm：消息发出者所保存的日志中最后一条的任期号，一般 MsgVote 会用到这个字段。
+//	Index：日志索引号。如果当前消息是 MsgVote 的话，代表这个 candidate 最后一条日志的索引号，
+//      	 它跟上面的 LogTerm 一起代表这个 candidate 所拥有的最新日志信息，
+//	       这样别人就可以比较自己的日志是不是比 candidate 的日志要新，从而决定是否投票。
+//	Entries：需要存储的日志。
+//	Commit：已经提交的日志的索引值，用来向别人同步日志的提交信息。
+//	Snapshot：一般跟MsgSnap合用，用来放置具体的Snapshot值。
+//	Reject，RejectHint：代表对方节点拒绝了当前节点的请求( MsgVote/MsgApp/MsgSnap/… )
 message Message {
 	optional MessageType type        = 1  [(gogoproto.nullable) = false];
 	optional uint64      to          = 2  [(gogoproto.nullable) = false];

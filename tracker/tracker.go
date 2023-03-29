@@ -26,6 +26,7 @@ import (
 // Config reflects the configuration tracked in a ProgressTracker.
 type Config struct {
 	Voters quorum.JointConfig
+
 	// AutoLeave is true if the configuration is joint and a transition to the
 	// incoming configuration should be carried out automatically by Raft when
 	// this is possible. If false, the configuration will be joint until the
@@ -271,20 +272,26 @@ func (p *ProgressTracker) TallyVotes() (granted int, rejected int, _ quorum.Vote
 	// contains members no longer part of the configuration. This doesn't really
 	// matter in the way the numbers are used (they're informational), but might
 	// as well get it right.
+	//
+	// 遍历每个节点
 	for id, pr := range p.Progress {
+		// 忽略 learner
 		if pr.IsLearner {
 			continue
 		}
+		// 是否已投票
 		v, voted := p.Votes[id]
 		if !voted {
 			continue
 		}
+		// 是否赞成/反对
 		if v {
 			granted++
 		} else {
 			rejected++
 		}
 	}
+
 	result := p.Voters.VoteResult(p.Votes)
 	return granted, rejected, result
 }

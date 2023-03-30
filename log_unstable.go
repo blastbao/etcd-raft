@@ -31,6 +31,8 @@ import pb "go.etcd.io/raft/v3/raftpb"
 // position in storage; this means that the next write to storage
 // might need to truncate the log before persisting unstable.entries.
 //
+// 客户端发来的请求，会先存入 unstable 中（一个数组），然后上层模块会将这些记录保存到其他地方（storage)
+// 持久化后会删除 unstable 中的记录，没持久化时不稳定，所以称为 unstable 。
 //
 // unstable 数据结构用于还没有被用户层持久化的数据，它维护了两部分内容 snapshot 和 entries 。
 //
@@ -72,6 +74,10 @@ type unstable struct {
 
 	// entries[i] has raft log position i+offset.
 	// entries 中第一条记录的索引值
+	//
+	// entries[0].Index == offset + 0
+	// entries[1].Index == offset + 1
+	// ...
 	offset uint64
 
 	// if true, snapshot is being written to storage.
@@ -182,7 +188,8 @@ func (u *unstable) acceptInProgress() {
 // 此时 unstable 要做的事情就是在自己的数据中查询，只有在满足任期号相同以及 i 大于等于 offset 的情况下，
 // 可以将 entries 中的数据进行缩容，将 i 之前的数据删除。
 func (u *unstable) stableTo(i, t uint64) {
-	// 尝试获取 i 的任期
+
+	// 尝试获取索引 i 的任期，如果不存在，直接返回
 	gt, ok := u.maybeTerm(i)
 	if !ok {
 		// Unstable entry missing. Ignore.
@@ -190,6 +197,7 @@ func (u *unstable) stableTo(i, t uint64) {
 		return
 	}
 
+	// 如果索引 i < offset, 则其已经持久化
 	if i < u.offset {
 		// Index matched unstable snapshot, not unstable entry. Ignore.
 		u.logger.Infof("entry at index %d matched unstable snapshot; ignoring", i)
@@ -205,6 +213,7 @@ func (u *unstable) stableTo(i, t uint64) {
 			"entry at (%d,%d) in unstable log; ignoring", i, t, i, gt)
 		return
 	}
+
 
 	num := int(i + 1 - u.offset)
 	u.entries = u.entries[num:] // 缩减数组
@@ -240,29 +249,49 @@ func (u *unstable) stableSnapTo(i uint64) {
 }
 
 func (u *unstable) restore(s pb.Snapshot) {
-	u.offset = s.Metadata.Index + 1
-	u.offsetInProgress = u.offset
-	u.entries = nil
-	u.snapshot = &s
-	u.snapshotInProgress = false
+	u.offset = s.Metadata.Index + 1	// 重置
+	u.offsetInProgress = u.offset	// 重置
+	u.entries = nil					// 重置
+	u.snapshot = &s					// 保存快照
+	u.snapshotInProgress = false	// 重置
 }
 
+//
+
 func (u *unstable) truncateAndAppend(ents []pb.Entry) {
-	// ents[0] 是这批 entries 的第一个消息，所以它的 Index 最小
+	// 获取第一条待追加的 Entry 记录的索引值
 	fromIndex := ents[0].Index
+
+	// 在 u.entries 中的日志条目的索引值是基于 offset 的
+	// 	entries[0].Index  == offset + 0
+	// 	entries[1].Index  == offset + 1
+	// 	...
+	//  entries[-1].Index == offset+uint64(len(u.entries)-1)
+	//
+	// 所以，下一个待写入的索引值为 u.offset+uint64(len(u.entries)) ，
+	// 如果
+	//	(1) fromIndex == u.offset+uint64(len(u.entries)) ，意味着索引值正好衔接，可以直接合并。
+	//  (2) fromIndex <= offset ，意味着 ???
+	//  (3) formIndex > offset ，意味着部分重叠
 	switch {
 	case fromIndex == u.offset+uint64(len(u.entries)):
 		// fromIndex is the next index in the u.entries, so append directly.
+		// 如果待追加的记录与 u.entries 中的记录正好连续，则可以直接向 u.entries 中追加
 		u.entries = append(u.entries, ents...)
 	case fromIndex <= u.offset:
 		u.logger.Infof("replace the unstable entries from index %d", fromIndex)
 		// The log is being truncated to before our current offset
 		// portion, so set the offset and replace the entries.
+		//
+		// 用待追加的 Entry 记录替换当前的 entries 字段，并更新 offset
 		u.entries = ents
 		u.offset = fromIndex
 		u.offsetInProgress = u.offset
 	default:
 		// Truncate to fromIndex (exclusive), and append the new entries.
+		//
+		// after 在 offset～last 之间，将 offset~after 之间的记录保留，抛弃 after 之后的记录
+
 		u.logger.Infof("truncate the unstable entries before index %d", fromIndex)
 		keep := u.slice(u.offset, fromIndex) // NB: appending to this slice is safe,
 		u.entries = append(keep, ents...)    // and will reallocate/copy it

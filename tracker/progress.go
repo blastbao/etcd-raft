@@ -65,6 +65,8 @@ type Progress struct {
 	// from the corresponding follower indicates the progress is active.
 	// RecentActive can be reset to false after an election timeout.
 	// This is always true on the leader.
+	//
+	// Follower 最近是否活跃，只要 Leader 收到任何一个消息就表示节点是最近是活跃的。
 	RecentActive bool
 
 	// MsgAppFlowPaused is used when the MsgApp flow to a node is throttled. This

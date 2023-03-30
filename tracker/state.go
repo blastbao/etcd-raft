@@ -15,6 +15,16 @@
 package tracker
 
 // StateType is the state of a tracked follower.
+//
+// 探测：
+//    一般是系统选举完成后，Leader 不知道所有 Follower 都是什么进度，所以需要发消息探测一下，从 Follower 的回复消息获取进度。
+//    在还没有收到回消息前都还是探测状态，因为不确定 Follower 是否活跃，所以发送太多的探测消息意义不大，只发送一个探测消息即可。
+// 复制：
+//    当 Peer 回复探测消息后，消息中有该节点接收的最大日志索引，如果回复的最大索引大于 Match ，以此索引更新 Match ，
+//    Progress 就进入了复制状态，开启高速复制模式。复制制状态不同于探测状态，Leader 会发送更多的日志消息来提升 IO 效率，就是上面提到的异步发送。
+//    这里就要引入 Inflight 概念了，飞行中的日志，意思就是已经发送给 Follower 还没有被确认接收的日志数据。
+// 快照：
+//   快照状态说明 Follower 正在复制 Leader 的快照。
 type StateType uint64
 
 const (

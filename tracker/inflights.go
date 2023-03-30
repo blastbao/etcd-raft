@@ -27,15 +27,19 @@ type inflight struct {
 // ack is received.
 type Inflights struct {
 	// the starting index in the buffer
+	// 记录第一条 MsgApp 消息的下标
 	start int
 
+	// 记录 MsgApp 消息的个数
 	count int    // number of inflight messages in the buffer
 	bytes uint64 // number of inflight bytes
 
+	// 当前 inflights 实例中记录的 MsgApp 消息个数的上限（最大长度）。
 	size     int    // the max number of inflight messages
 	maxBytes uint64 // the max total byte size of inflight messages
 
 	// buffer is a ring buffer containing info about all in-flight messages.
+	// 用来记录 MsgApp 消息相关信息的数组，其中记录的是 MsgApp 消息中最后一条 Entry 记录的索引值，被当成环形数组使用
 	buffer []inflight
 }
 
@@ -62,20 +66,29 @@ func (in *Inflights) Clone() *Inflights {
 // size is being dispatched. Full() must be called prior to Add() to verify that
 // there is room for one more message, and consecutive calls to Add() must
 // provide a monotonic sequence of indexes.
+//
+// 用来记录发送出去的 MsgApp 消息(一个一个的递增)
 func (in *Inflights) Add(index, bytes uint64) {
+	// 检测当前 buffer 是否已满
 	if in.Full() {
 		panic("cannot add into a Full inflights")
 	}
+	// 获取新增消息的下标
 	next := in.start + in.count
+	// 环形回绕
 	size := in.size
 	if next >= size {
 		next -= size
 	}
+	// 进行扩容（2倍）
 	if next >= len(in.buffer) {
 		in.grow()
 	}
+	// 在 next 位置记录消息中最后一条 Entry 的索引值
 	in.buffer[next] = inflight{index: index, bytes: bytes}
+	// 消息数 +1
 	in.count++
+	// 字节数 +1
 	in.bytes += bytes
 }
 
@@ -95,6 +108,8 @@ func (in *Inflights) grow() {
 }
 
 // FreeLE frees the inflights smaller or equal to the given `to` flight.
+//
+// 将指定消息及其之前的消息全部清空，释放 inflights 空间，让后面的消息继续发送
 func (in *Inflights) FreeLE(to uint64) {
 	if in.count == 0 || to < in.buffer[in.start].index {
 		// out of the left side of the window

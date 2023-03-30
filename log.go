@@ -31,15 +31,16 @@ import (
 // 一条日志数据，首先需要被提交（committed）成功，然后才能被应用（applied）到状态机中。
 // 因此，以下不等式一直成立：applied <= committed。
 type raftLog struct {
+
 	// storage contains all stable entries since the last snapshot.
 	//
-	// 之前以为是 storage 表示“协商一致的提案”，unstable表示“协商中的提案”，然后后者协商一致后，挪到前者。
-	// 然而我错了，storage 如字面意思，就是存储的，已经落地了，但是目前只有一个实现 MemoryStorage，也是搞笑
-	// unstable 表示不稳定的，在内存里的数据
+	// storage 保存自从最后一次snapshot之后提交的数据
 	storage Storage
 
 	// unstable contains all unstable entries and snapshot.
 	// they will be saved into storage.
+	//
+	// unstable 保存还没有持久化的数据和快照，这些数据最终都会保存到 storage 中
 	unstable unstable
 
 	// committed is the highest log position that is known to be in
@@ -66,7 +67,8 @@ type raftLog struct {
 	// or asynchronously).
 	// Invariant: applied <= committed
 	//
-	// 已应用
+	// committed 保存是写入持久化存储中的最高 index ，而 applied 保存的是传入状态机中的最高 index 。
+	// 一条日志首先要提交成功（即 committed ），才能被 applied 到状态机中，因此不等式一直成立：applied <= committed 。
 	applied uint64
 
 	logger Logger
@@ -144,20 +146,24 @@ func (l *raftLog) String() string {
 // maybeAppend returns (0, false) if the entries cannot be appended. Otherwise,
 // it returns (last index of new entries, true).
 func (l *raftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry) (lastnewi uint64, ok bool) {
-	// 查看 index 的 term 与 logTerm 是否匹配
+
+	// 1. 首先根据消息的 prevLogIndex ，寻找自己存储的对应日志项，读取该日志项的 term ，判断是否与 prevLogTerm 匹配
 	if !l.matchTerm(index, logTerm) {
+		// 不匹配，返回
 		return 0, false
 	}
 
+	// 最新的日志条目 id
 	lastnewi = index + uint64(len(ents))
 
-	// 查找 entries 中，index 与 term 冲突的位置
+	// 2. 若匹配，则先寻找冲突项，正常情况下，冲突项的索引会大于自己的 committed
 	ci := l.findConflict(ents)
 	switch {
 	case ci == 0:// 没有冲突，全部追加
 	case ci <= l.committed:// 如果冲突的位置在已提交的位置之前，报错
 		l.logger.Panicf("entry %d conflict with committed entry [committed(%d)]", ci, l.committed)
-	default: // 如果冲突的位置在提交位置之后，部分追加
+	default:
+		// 3. 追加剩余的日志，这里会把原日志的冲突项之后的一并删除，并用新的日志项追加和替代
 		offset := index + 1
 		if ci-offset > uint64(len(ents)) {
 			l.logger.Panicf("index, %d, is out of range [%d]", ci-offset, len(ents))
@@ -165,6 +171,7 @@ func (l *raftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry
 		l.append(ents[ci-offset:]...)
 	}
 
+	// 4. 提交，更新自己的 committedIndex
 	l.commitTo(min(committed, lastnewi))
 	return lastnewi, true
 }
@@ -367,6 +374,7 @@ func (l *raftLog) lastIndex() uint64 {
 func (l *raftLog) commitTo(tocommit uint64) {
 	// never decrease commit
 	if l.committed < tocommit {
+		// 不能提交自身没有的 entries
 		if l.lastIndex() < tocommit {
 			l.logger.Panicf("tocommit(%d) is out of range [lastIndex(%d)]. Was the raft log corrupted, truncated, or lost?", tocommit, l.lastIndex())
 		}
@@ -481,6 +489,9 @@ func (l *raftLog) allEntries() []pb.Entry {
 // later term is more up-to-date. If the logs end with the same term, then
 // whichever log has the larger lastIndex is more up-to-date. If the logs are
 // the same, the given log is up-to-date.
+//
+//
+//
 func (l *raftLog) isUpToDate(lasti, term uint64) bool {
 	return term > l.lastTerm() || (term == l.lastTerm() && lasti >= l.lastIndex())
 }
@@ -507,7 +518,9 @@ func (l *raftLog) maybeCommit(maxIndex, term uint64) bool {
 
 func (l *raftLog) restore(s pb.Snapshot) {
 	l.logger.Infof("log [%s] starts to restore snapshot [index: %d, term: %d]", l, s.Metadata.Index, s.Metadata.Term)
+	// 快照包含的数据一定是已提交的
 	l.committed = s.Metadata.Index
+	// 保存 s 并重置内部变量
 	l.unstable.restore(s)
 }
 

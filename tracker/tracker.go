@@ -25,6 +25,7 @@ import (
 
 // Config reflects the configuration tracked in a ProgressTracker.
 type Config struct {
+
 	Voters quorum.JointConfig
 
 	// AutoLeave is true if the configuration is joint and a transition to the
@@ -115,6 +116,8 @@ func (c *Config) Clone() Config {
 // ProgressTracker tracks the currently active configuration and the information
 // known about the nodes and learners in it. In particular, it tracks the match
 // index for each peer which in turn allows reasoning about the committed index.
+//
+// ProgressTracker 是 Progress 的管理者，可以理解为 Leader 跟踪所有 Peer 的 Progress 。
 type ProgressTracker struct {
 	Config
 
@@ -127,6 +130,8 @@ type ProgressTracker struct {
 }
 
 // MakeProgressTracker initializes a ProgressTracker.
+//
+// 新建空配置。
 func MakeProgressTracker(maxInflight int, maxBytes uint64) ProgressTracker {
 	p := ProgressTracker{
 		MaxInflight:      maxInflight,
@@ -142,10 +147,13 @@ func MakeProgressTracker(maxInflight int, maxBytes uint64) ProgressTracker {
 		Votes:    map[uint64]bool{},
 		Progress: map[uint64]*Progress{},
 	}
+
 	return p
 }
 
 // ConfState returns a ConfState representing the active configuration.
+//
+// 返回当前激活的配置。
 func (p *ProgressTracker) ConfState() pb.ConfState {
 	return pb.ConfState{
 		Voters:         p.Voters[0].Slice(),
@@ -158,6 +166,8 @@ func (p *ProgressTracker) ConfState() pb.ConfState {
 
 // IsSingleton returns true if (and only if) there is only one voting member
 // (i.e. the leader) in the current configuration.
+//
+// 判断当前配置是否为单节点模式（ voter 数为 0 ，且不处于 joint configuration 中）。
 func (p *ProgressTracker) IsSingleton() bool {
 	return len(p.Voters[0]) == 1 && len(p.Voters[1]) == 0
 }
@@ -177,6 +187,8 @@ func (l matchAckIndexer) AckedIndex(id uint64) (quorum.Index, bool) {
 
 // Committed returns the largest log index known to be committed based on what
 // the voting members of the group have acknowledged.
+//
+// 返回被 quorum 接受的 commit index 。
 func (p *ProgressTracker) Committed() uint64 {
 	return uint64(p.Voters.CommittedIndex(matchAckIndexer(p.Progress)))
 }
@@ -191,6 +203,8 @@ func insertionSort(sl []uint64) {
 }
 
 // Visit invokes the supplied closure for all tracked progresses in stable order.
+//
+// 有序遍历追踪的所有 Progress ，并对其执行传入的函数闭包。
 func (p *ProgressTracker) Visit(f func(id uint64, pr *Progress)) {
 	n := len(p.Progress)
 	// We need to sort the IDs and don't want to allocate since this is hot code.
@@ -215,6 +229,8 @@ func (p *ProgressTracker) Visit(f func(id uint64, pr *Progress)) {
 
 // QuorumActive returns true if the quorum is active from the view of the local
 // raft state machine. Otherwise, it returns false.
+//
+// 判断是否有达到 quorum 数量的节点处于活跃状态（用于 Check Quorum ）。
 func (p *ProgressTracker) QuorumActive() bool {
 	votes := map[uint64]bool{}
 	p.Visit(func(id uint64, pr *Progress) {
@@ -228,6 +244,8 @@ func (p *ProgressTracker) QuorumActive() bool {
 }
 
 // VoterNodes returns a sorted slice of voters.
+//
+// 返回有序的 voter 节点 id 集合。
 func (p *ProgressTracker) VoterNodes() []uint64 {
 	m := p.Voters.IDs()
 	nodes := make([]uint64, 0, len(m))
@@ -239,6 +257,8 @@ func (p *ProgressTracker) VoterNodes() []uint64 {
 }
 
 // LearnerNodes returns a sorted slice of learners.
+//
+// 返回有序的 learner 节点 id 集合。
 func (p *ProgressTracker) LearnerNodes() []uint64 {
 	if len(p.Learners) == 0 {
 		return nil
@@ -252,12 +272,16 @@ func (p *ProgressTracker) LearnerNodes() []uint64 {
 }
 
 // ResetVotes prepares for a new round of vote counting via recordVote.
+//
+// 重置记录的选票。
 func (p *ProgressTracker) ResetVotes() {
 	p.Votes = map[uint64]bool{}
 }
 
 // RecordVote records that the node with the given id voted for this Raft
 // instance if v == true (and declined it otherwise).
+//
+// 记录来自节点 id 的选票是 true/false 。
 func (p *ProgressTracker) RecordVote(id uint64, v bool) {
 	_, ok := p.Votes[id]
 	if !ok {
@@ -267,6 +291,8 @@ func (p *ProgressTracker) RecordVote(id uint64, v bool) {
 
 // TallyVotes returns the number of granted and rejected Votes, and whether the
 // election outcome is known.
+//
+// 返回选票中赞同数、反对数、与当前投票结果
 func (p *ProgressTracker) TallyVotes() (granted int, rejected int, _ quorum.VoteResult) {
 	// Make sure to populate granted/rejected correctly even if the Votes slice
 	// contains members no longer part of the configuration. This doesn't really

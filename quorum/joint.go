@@ -28,6 +28,7 @@ func (c JointConfig) String() string {
 // IDs returns a newly initialized map representing the set of voters present
 // in the joint configuration.
 func (c JointConfig) IDs() map[uint64]struct{} {
+
 	m := map[uint64]struct{}{}
 	for _, cc := range c {
 		for id := range cc {
@@ -46,9 +47,12 @@ func (c JointConfig) Describe(l AckedIndexer) string {
 // CommittedIndex returns the largest committed index for the given joint
 // quorum. An index is jointly committed if it is committed in both constituent
 // majorities.
+//
+// CommittedIndex 返回给定 JointConfig 的最大提交索引。
 func (c JointConfig) CommittedIndex(l AckedIndexer) Index {
 	idx0 := c[0].CommittedIndex(l)
 	idx1 := c[1].CommittedIndex(l)
+	// 返回的是二者最小的那个
 	if idx0 < idx1 {
 		return idx0
 	}

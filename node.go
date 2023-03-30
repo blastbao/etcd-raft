@@ -51,10 +51,33 @@ func (a *SoftState) equal(b *SoftState) bool {
 // Ready encapsulates the entries and messages that are ready to read,
 // be saved to stable storage, committed or sent to other peers.
 // All fields in Ready are read-only.
+//
+//
+// Ready 结构体：
+//
+// 它是让应用层感知 raft 节点状态变化的传递对象，是由 node 生成传递给上层应用的，
+// 里面封装了 raft 节点状态的变化、待写入 WAL 和写入 MemoryStorage 的 Entry 日志、commit 了待应用的日志、快照数据和待发送的消息等信息，
+// 当这些有一个有更改时 node 就会检测到并生成 Ready 实例写到一个 channel 中，上层应用会调用 node 的 api 方法读取出来进行处理，
+// 每次只能进行一个 Ready 对象的处理，Ready 对象如果上层还没处理完，不会产生下一个 Ready 对象，当上层应用处理完了，
+// 会通过调用 node 节点 Advance 方法来告知 Ready 实例已经应用完了。
+//
+// Ready 中成员变量：
+//	SoftState：表示的是对应的各个节点的可变状态，与 raft 论文中相对应。
+//	HardState：表示的是当前节点的 Term/Vote/Commit 信息，这些需要被持久化。
+//	ReadStates：主要用于实现线性一致性读，这里先不去深究。
+//	Entries：需要持久化保存的日志，主要是 raft 协议层中不稳定的日志，也就是没有提交的日志。
+//	Snapshot：需要持久化保存的快照。
+//	CommittedEntries：被提交的日志，但是还没有提交到状态机。
+//	Messages：在 Entries 被持久化入日志后，需要被发送到 Follower 节点的消息。
 type Ready struct {
 	// The current volatile state of a Node.
 	// SoftState will be nil if there is no update.
 	// It is not required to consume or store SoftState.
+	//
+	// 当前 node 的状态信息，主要记录了
+	//	- Leader 是谁 ？
+	//	- 当前 node 处于什么状态，是 Leader，还是 Follower ？
+	// 用于更新 etcd server 的状态
 	*SoftState
 
 	// The current state of a Node to be saved to stable storage BEFORE
@@ -65,12 +88,16 @@ type Ready struct {
 	// If async storage writes are enabled, this field does not need to be acted
 	// on immediately. It will be reflected in a MsgStorageAppend message in the
 	// Messages slice.
+	//
+	// 包含当前节点见过的最大的 term ，以及在这个 term 给谁投过票，以及当前节点知道的 commit index ，这部分数据会持久化
 	pb.HardState
 
 	// ReadStates can be used for node to serve linearizable read requests locally
 	// when its applied index is greater than the index in ReadState.
 	// Note that the readState will be returned when raft receives msgReadIndex.
 	// The returned is only valid for the request that requested to read.
+	//
+	// 用于返回已经确认 Leader 身份的 read 请求的 commit index
 	ReadStates []ReadState
 
 	// Entries specifies entries to be saved to stable storage BEFORE
@@ -86,6 +113,8 @@ type Ready struct {
 	// If async storage writes are enabled, this field does not need to be acted
 	// on immediately. It will be reflected in a MsgStorageAppend message in the
 	// Messages slice.
+	//
+	// 需要持久化的快照
 	Snapshot pb.Snapshot
 
 	// CommittedEntries specifies entries to be committed to a
@@ -95,6 +124,8 @@ type Ready struct {
 	// If async storage writes are enabled, this field does not need to be acted
 	// on immediately. It will be reflected in a MsgStorageApply message in the
 	// Messages slice.
+	//
+	// 已经 commit 了，还没有 apply 到状态机的日志
 	CommittedEntries []pb.Entry
 
 	// Messages specifies outbound messages.
@@ -109,6 +140,8 @@ type Ready struct {
 	//
 	// If it contains a MsgSnap message, the application MUST report back to raft
 	// when the snapshot has been received or has failed by calling ReportSnapshot.
+	//
+	// 需要发送给 peers 的消息
 	Messages []pb.Message
 
 	// MustSync indicates whether the HardState and Entries must be durably
@@ -231,15 +264,20 @@ func setupNode(c *Config, peers []Peer) *node {
 	if len(peers) == 0 {
 		panic("no peers given; use RestartNode instead")
 	}
+
+	// 初始化一个实际节点，里面包含一个 raft ，实现具体的 raft 的协议
 	rn, err := NewRawNode(c)
 	if err != nil {
 		panic(err)
 	}
+
+	// 在启动前会先加载配置，如果 Storage 接口方法返回非空这个方法将会返回错误，即初始化启动时 Storage 接口返回应该为空
 	err = rn.Bootstrap(peers)
 	if err != nil {
 		c.Logger.Warningf("error occurred during starting a new node: %v", err)
 	}
 
+	// 包含一个 rawNode ，同时包含一些 channel 用于接受传入的消息，通过这个 node 将消息传入 raft
 	n := newNode(rn)
 	return &n
 }
@@ -248,6 +286,11 @@ func setupNode(c *Config, peers []Peer) *node {
 // It appends a ConfChangeAddNode entry for each given peer to the initial log.
 //
 // Peers must not be zero length; call RestartNode in that case.
+//
+// 直接调用 raft 包有两种方法：StartNode 和 RestartNode 。
+//
+// 方案一：
+// 启动时会检查同辈节点，如果同辈节点为空就会建议采用第二种方案。
 func StartNode(c *Config, peers []Peer) Node {
 	n := setupNode(c, peers)
 	go n.run()
@@ -258,6 +301,10 @@ func StartNode(c *Config, peers []Peer) Node {
 // The current membership of the cluster will be restored from the Storage.
 // If the caller has an existing state machine, pass in the last log index that
 // has been applied to it; otherwise use zero.
+//
+// 方案二：
+// RestartNode 是一种重启方案，不会去检查同辈节点，集群成员关系将会从 Storage 加载，
+// Storage 是 raft 提供给用户自定义持久化数据的接口，换言之我们需要在 Storage 中保存集群的成员关系。
 func RestartNode(c *Config) Node {
 	rn, err := NewRawNode(c)
 	if err != nil {
@@ -275,16 +322,16 @@ type msgWithResult struct {
 
 // node is the canonical implementation of the Node interface
 type node struct {
-	propc      chan msgWithResult
-	recvc      chan pb.Message
+	propc      chan msgWithResult	 // 向 raft StateMachine 提交一个 Propose（normal op/conf change）
+	recvc      chan pb.Message		 // 向 raft StateMachine 提交 Peer 发送过来的一些 Message，例如一些 Response，或者对 Follower 来说各种 request message
 	confc      chan pb.ConfChangeV2
 	confstatec chan pb.ConfState
-	readyc     chan Ready
-	advancec   chan struct{}
-	tickc      chan struct{}
+	readyc     chan Ready			 // 向上层应用 raftNode 输出 Ready 好的数据和状态
+	advancec   chan struct{}		 // 用于 raftNode 通知 raft StateMachine 当前 Ready 处理完了，准备下一个
+	tickc      chan struct{}		 // 用于 raftNode 通知 raft StateMachine，滴答逻辑时钟推进
 	done       chan struct{}
 	stop       chan struct{}
-	status     chan chan Status
+	status     chan chan Status      // 向上层应用输出 raft state machine 状态
 
 	rn *RawNode
 }
@@ -309,6 +356,7 @@ func newNode(rn *RawNode) node {
 }
 
 func (n *node) Stop() {
+	// 触发关闭，若已关闭则返回
 	select {
 	case n.stop <- struct{}{}:
 		// Not already stopped, so trigger it
@@ -316,10 +364,21 @@ func (n *node) Stop() {
 		// Node has already been stopped - no need to do anything
 		return
 	}
+
 	// Block until the stop has been acknowledged by run()
+	// 等待关闭完成
 	<-n.done
 }
 
+// run() 方法中，主要处理：
+//	获取新产生的 Ready ，并塞入 readyc 通道供上层处理
+//	探测 Leader 变化，仅当集群中存在已知 leader 时才会处理提案
+//	监听各种通道，处理消息：
+//	 - propc：处理 Propose 的请求消息
+//	 - confc：处理 ProposeConfChange 的配置变更请求消息
+//	 - recvc：处理响应消息
+//	 - tickc, advancec：处理上层的 Tick 和 Advance 的信号
+//	其他
 func (n *node) run() {
 	var propc chan msgWithResult
 	var readyc chan Ready
@@ -328,10 +387,12 @@ func (n *node) run() {
 
 	r := n.rn.raft
 
+	// 初始状态不知道谁是 leader ，需要通过 Ready 获取
 	lead := None
 
 	for {
 
+		// 1. 轮询时，首先将新产生的 Ready 取出来存入 rd 中，同时设置 readyc 管道
 		if advancec == nil && n.rn.HasReady() {
 			// Populate a Ready. Note that this Ready is not guaranteed to
 			// actually be handled. We will arm readyc, but there's no guarantee
@@ -341,11 +402,17 @@ func (n *node) run() {
 			// handled first, but it's generally good to emit larger Readys plus
 			// it simplifies testing (by emitting less frequently and more
 			// predictably).
+			//
+			// 拿到 raft 层的 Ready 数据
 			rd = n.rn.readyWithoutAccept()
+
+			//
 			readyc = n.readyc
 		}
 
+		// 2. 探测 Leader 变化并打日志，仅当集群中存在
 		if lead != r.lead {
+			// 知道 leader 是谁后就可以通过 propc 读取数据，否则不处理。
 			if r.hasLeader() {
 				if lead == None {
 					r.logger.Infof("raft.node: %x elected leader %x at term %d", r.id, r.lead, r.Term)
@@ -357,28 +424,38 @@ func (n *node) run() {
 				r.logger.Infof("raft.node: %x lost leader %x at term %d", r.id, lead, r.Term)
 				propc = nil
 			}
+			// 保存当前 leader
 			lead = r.lead
 		}
 
+		// 3. 监听通道以进行处理
 		select {
 		// TODO: maybe buffer the config propose if there exists one (the way
 		// described in raft dissertation)
 		// Currently it is dropped in Step silently.
+		//
+		// 外部对 Node 调用 Propose 时，这里会收到消息并处理（如追加日志、投票等），然后把raft的返回值在返回给调用者
 		case pm := <-propc:
+			// 解析消息
 			m := pm.m
 			m.From = r.id
+			// 处理消息
 			err := r.Step(m)
+			// 返回结果
 			if pm.result != nil {
 				pm.result <- err
 				close(pm.result)
 			}
-		case m := <-n.recvc:
+		//
+		case m := <-n.recvc: // 这里会收到并处理响应消息
+			// 相比于 propc 中的数据处理，多了一些判断
 			if IsResponseMsg(m.Type) && !IsLocalMsgTarget(m.From) && r.prs.Progress[m.From] == nil {
 				// Filter out response message from unknown From.
 				break
 			}
 			r.Step(m)
-		case cc := <-n.confc:
+		// 配置修改处理
+		case cc := <-n.confc: // 外部对 Node 调用 ProposeConfChange 时，这里会收到，处理集群配置变更
 			_, okBefore := r.prs.Progress[r.id]
 			cs := r.applyConfChange(cc)
 			// If the node was removed, block incoming proposals. Note that we
@@ -411,22 +488,27 @@ func (n *node) run() {
 			case n.confstatec <- cs:
 			case <-n.done:
 			}
-		case <-n.tickc:
+		case <-n.tickc:// 外部对 Node 调用 Tick 时，这里会收到，并自增 tick 计数器
 			n.rn.Tick()
+		// 将新取出来的 Ready 放入 ready 通道中，供上层对 Node 调用 Ready() 获取并处理。
 		case readyc <- rd:
+			// 告诉 raft ，ready 数据已被接收
 			n.rn.acceptReady(rd)
 			if !n.rn.asyncStorageWrites {
-				advancec = n.advancec
+				advancec = n.advancec // 赋值 Advance channel ，等待 Ready 处理完成的消息
 			} else {
 				rd = Ready{}
 			}
 			readyc = nil
+		// 使用者处理完 Ready 数据后，调用了 Advance() ，这里会收到，并对 raft 调用 Advance 表示处理外之前弹出的 Ready
 		case <-advancec:
 			n.rn.Advance(rd)
 			rd = Ready{}
 			advancec = nil
+		// 获取状态
 		case c := <-n.status:
 			c <- getStatus(r)
+		// 停止 Raft 节点
 		case <-n.stop:
 			close(n.done)
 			return
@@ -437,7 +519,7 @@ func (n *node) run() {
 // Tick increments the internal logical clock for this Node. Election timeouts
 // and heartbeat timeouts are in units of ticks.
 //
-//
+// 定时器触发一次
 func (n *node) Tick() {
 	select {
 	case n.tickc <- struct{}{}:
@@ -449,6 +531,7 @@ func (n *node) Tick() {
 
 func (n *node) Campaign(ctx context.Context) error { return n.step(ctx, pb.Message{Type: pb.MsgHup}) }
 
+// Propose 发起新的提案
 func (n *node) Propose(ctx context.Context, data []byte) error {
 	return n.stepWait(ctx, pb.Message{Type: pb.MsgProp, Entries: []pb.Entry{{Data: data}}})
 }
@@ -489,6 +572,7 @@ func (n *node) stepWait(ctx context.Context, m pb.Message) error {
 // Step advances the state machine using msgs. The ctx.Err() will be returned,
 // if any.
 func (n *node) stepWithWaitOption(ctx context.Context, m pb.Message, wait bool) error {
+	// 如果消息非 Prop 类型，则写入到 n.recvc 管道，否则写入到 n.propc 管道
 	if m.Type != pb.MsgProp {
 		select {
 		case n.recvc <- m:
@@ -499,31 +583,41 @@ func (n *node) stepWithWaitOption(ctx context.Context, m pb.Message, wait bool) 
 			return ErrStopped
 		}
 	}
+
+	// 提案管道
 	ch := n.propc
+
+	// 封装消息
 	pm := msgWithResult{m: m}
+	// 等待响应
 	if wait {
 		pm.result = make(chan error, 1)
 	}
+
+	// 发送消息
 	select {
-	case ch <- pm:
-		if !wait {
+	case ch <- pm:// 将 Prop 消息写入提案管道
+		if !wait { // 若不关心结果，直接返回即可
 			return nil
 		}
-	case <-ctx.Done():
+	case <-ctx.Done():// 超时
 		return ctx.Err()
-	case <-n.done:
+	case <-n.done:// 关闭
 		return ErrStopped
 	}
+
+	// 等待响应
 	select {
-	case err := <-pm.result:
+	case err := <-pm.result:// 处理结果
 		if err != nil {
 			return err
 		}
-	case <-ctx.Done():
+	case <-ctx.Done():	// 超时
 		return ctx.Err()
-	case <-n.done:
+	case <-n.done:		// 关闭
 		return ErrStopped
 	}
+
 	return nil
 }
 

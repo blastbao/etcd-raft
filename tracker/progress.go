@@ -31,6 +31,22 @@ import (
 // Leader 通过 Progress 这个数据结构来追踪一个 follower 的状态，并根据 Progress 里的信息来决定每次同步的日志项。
 //
 type Progress struct {
+
+	// 正常情况下，follower 与 leader 的 entry 列表应该完全一样，但由于:
+	//	- leader 处理新接收到的 entry ；
+	//  - 节点故障而导致新一轮选举；
+	//  - 有新节点加入；
+	// 导致 follower 与 leader 之间出现不一致，这时候 leader 首先要了解 follower 的进度与自己进度的区别，此时 follower 处于 probe 状态。
+	// 如果 follower 接收并成功复制来自 leader 的 entry ，那么 follower 进入 replicate 状态，leader 一次可以发出大于一条 entry 以提高传输效率。
+	//
+	// 在未了解 follower 的进度时，leader 的行为是设置 match=0 和 next=lastIndex+1 。
+	// 这样做是假定 follower 已经复制了所有 leader 上的日志。
+	// 下一次 leader 向其 follower 发起复制的时候，如果 follower 实际上落后一些，会 reject 新的日志，并会告知 leader 自己的当前状态，
+	// leader 根据情况再协调后续的发送。
+
+	// match：follower 与 leader 间一致的最大的 entry
+	// next：leader 下一个要复制到 follower 的 entry
+
 	// 用来保存当前 follower 节点的日志状态：
 	//	Match：保存目前为止，已复制给该 follower 的日志的最高索引值。如果 leader 对该 follower 上的日志情况一无所知的话，这个值被设为 0 。
 	//	Next：保存下一次 leader 发送 append 消息给该 follower 的日志索引，即下一次复制日志时，leader 会从 Next 开始发送日志。
@@ -151,6 +167,7 @@ func (pr *Progress) BecomeReplicate() {
 // BecomeSnapshot moves the Progress to StateSnapshot with the specified pending
 // snapshot index.
 func (pr *Progress) BecomeSnapshot(snapshoti uint64) {
+	// 将该 follower 的进度状态转为 StateSnapshot 状态
 	pr.ResetState(StateSnapshot)
 	pr.PendingSnapshot = snapshoti
 }

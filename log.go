@@ -103,7 +103,7 @@ func newLogWithSize(storage Storage, logger Logger, maxApplyingEntsSize entryEnc
 		log.Panic("storage must not be nil")
 	}
 
-	// 创建 raftLog 实例，并初始化 storage 字段
+	// 创建 raftLog 实例，并初始化 storage 字段，主要是保存 raft 的日志数据
 	log := &raftLog{
 		storage:             storage,
 		logger:              logger,

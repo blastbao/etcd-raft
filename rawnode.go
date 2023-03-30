@@ -137,30 +137,45 @@ func (rn *RawNode) Ready() Ready {
 // readyWithoutAccept returns a Ready. This is a read-only operation, i.e. there
 // is no obligation that the Ready must be handled.
 func (rn *RawNode) readyWithoutAccept() Ready {
+
+	//
 	r := rn.raft
 
-
+	//
 	rd := Ready{
+		// 未持久化数据塞到了 Entries 数组中
 		Entries:          r.raftLog.nextUnstableEnts(),
+		// 已经达成一致可以提交的日志数据放入到 CommittedEntries 数组中
 		CommittedEntries: r.raftLog.nextCommittedEnts(rn.applyUnstableEntries()),
+		// 保存待发送的消息
 		Messages:         r.msgs,
 	}
 
+	// 软状态有变化就要输出，软状态是通过raft对象获取的。
 	if softSt := r.softState(); !softSt.equal(rn.prevSoftSt) {
 		// Allocate only when SoftState changes.
 		escapingSoftSt := softSt
 		rd.SoftState = &escapingSoftSt
 	}
+
+	// 硬状态有变化就要输出，硬状态是通过raft对象获取的。
 	if hardSt := r.hardState(); !isHardStateEqual(hardSt, rn.prevHardSt) {
 		rd.HardState = hardSt
 	}
+
+	// 如果有新快照需要存储，那就通过 Ready 输出给使用者。
 	if r.raftLog.hasNextUnstableSnapshot() {
 		rd.Snapshot = *r.raftLog.nextUnstableSnapshot()
 	}
+
+	// 如果有 ReadIndex() 的结果，那就通过 Ready 输出。
 	if len(r.readStates) != 0 {
 		rd.ReadStates = r.readStates
 	}
+
+	// 设置必须同步标记，见下面有函数的解析，其实在 etcd 中并没有用 Ready.MustSync 标记，而是用了 MustSync() 函数。
 	rd.MustSync = MustSync(r.hardState(), rn.prevHardSt, len(rd.Entries))
+
 
 	if rn.asyncStorageWrites {
 		// If async storage writes are enabled, enqueue messages to
@@ -190,12 +205,20 @@ func (rn *RawNode) readyWithoutAccept() Ready {
 
 // MustSync returns true if the hard state and count of Raft entries indicate
 // that a synchronous write to persistent storage is required.
+//
+// 设置是否必须同步
 func MustSync(st, prevst pb.HardState, entsnum int) bool {
 	// Persistent state on all servers:
 	// (Updated on stable storage before responding to RPCs)
 	// currentTerm
 	// votedFor
 	// log entries[]
+	//
+	// 有不可靠日志、leader 更换以及换届选举都需要设置同步标记，
+	// 也就是说当有不可靠日志或者新一轮选举发生时，必须等到这些数据同步到可靠存储后才能继续执行，
+	// 这还算是比较好理解，毕竟这些状态是全局性的，需要 leader 统计超过半数可靠可靠以后确认为可靠的数据。
+	//
+	// 如果此时采用异步实现，就会出现不一致的可能性。
 	return entsnum != 0 || st.Vote != prevst.Vote || st.Term != prevst.Term
 }
 
@@ -402,15 +425,19 @@ func newStorageApplyRespMsg(r *raft, ents []pb.Entry) pb.Message {
 // ahead and handle a Ready. Nothing must alter the state of the RawNode between
 // this call and the prior call to Ready().
 func (rn *RawNode) acceptReady(rd Ready) {
+
 	if rd.SoftState != nil {
 		rn.prevSoftSt = rd.SoftState
 	}
+
 	if !IsEmptyHardState(rd.HardState) {
 		rn.prevHardSt = rd.HardState
 	}
+
 	if len(rd.ReadStates) != 0 {
 		rn.raft.readStates = nil
 	}
+
 	if !rn.asyncStorageWrites {
 		if len(rn.stepsOnAdvance) != 0 {
 			rn.raft.logger.Panicf("two accepted Ready structs without call to Advance")
@@ -429,6 +456,7 @@ func (rn *RawNode) acceptReady(rd Ready) {
 			rn.stepsOnAdvance = append(rn.stepsOnAdvance, m)
 		}
 	}
+
 	rn.raft.msgs = nil
 	rn.raft.msgsAfterAppend = nil
 	rn.raft.raftLog.acceptUnstable()
@@ -459,9 +487,12 @@ func (rn *RawNode) HasReady() bool {
 	if r.raftLog.hasNextUnstableSnapshot() {
 		return true
 	}
+
+
 	if len(r.msgs) > 0 || len(r.msgsAfterAppend) > 0 {
 		return true
 	}
+
 	if r.raftLog.hasNextUnstableEnts() || r.raftLog.hasNextCommittedEnts(rn.applyUnstableEntries()) {
 		return true
 	}

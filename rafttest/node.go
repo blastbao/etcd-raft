@@ -69,19 +69,25 @@ func (n *node) start() {
 	go func() {
 		for {
 			select {
+			// 定时器
 			case <-ticker:
 				n.Tick()
+			// 读取 node.readyC 通道，该通道是 raft 与上层应用交互的主要 channel 之一，其中传递的 Ready 实例封装了很多信息。
 			case rd := <-n.Ready():
+
 				if !raft.IsEmptyHardState(rd.HardState) {
 					n.mu.Lock()
 					n.state = rd.HardState
 					n.mu.Unlock()
 					n.storage.SetHardState(n.state)
 				}
+
+				// 将待持久化的 Entries 记录追加到 storage 中完成持久化
 				n.storage.Append(rd.Entries)
 				time.Sleep(time.Millisecond)
 
 				// simulate async send, more like real world...
+				// 将待发送的消息发送到指定节点
 				for _, m := range rd.Messages {
 					mlocal := m
 					go func() {
@@ -89,6 +95,8 @@ func (n *node) start() {
 						n.iface.send(mlocal)
 					}()
 				}
+
+				//
 				n.Advance()
 			case m := <-n.iface.recv():
 				go n.Step(context.TODO(), m)

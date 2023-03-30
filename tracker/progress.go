@@ -91,6 +91,10 @@ type Progress struct {
 	// 流量控制，因为如果同步请求非常多，再碰上网络分区时，leader 可能会累积很多待发送消息，
 	// 一旦网络恢复，可能会有非常大流量发送给follower，所以这里要做 flow control 。
 	// 它的实现有点类似 TCP 的滑动窗口，这里不再赘述。
+	//
+	// inflights 的主要功能是记录当前节点己发出但未收到响应的 MsgApp 消息。
+	// 当 Leader 节点发送 MsgApp 消息时，通过 inflights.add() 方法来记录发送出去的 MsgApp 消息；
+	// 当 Leader 节点收到 MsgAppResp 消息时，通过 inflights.freeTo() 方法将指定消息及其之前的消息清空，释放 inflights 空间，让后面的消息继续发送。
 	Inflights *Inflights
 
 	// IsLearner is true if this progress is tracked for a learner.
@@ -205,7 +209,13 @@ func (pr *Progress) OptimisticUpdate(n uint64) { pr.Next = n + 1 }
 //
 // If the rejection is genuine, Next is lowered sensibly, and the Progress is
 // cleared for sending log entries.
+//
+// 在 raft 的论文中提出通过遍历 index 和 term 的方式保证日志的一致性。
+// 具体的实现位于 maybeDecrTo ，因为 follower 在拒绝请求时带上了当前最新的 log index ，
+// 因此在进行日志补推时，直接将 next 至为 follower 中最新的 log index 和当前 index 中的最小值。
 func (pr *Progress) MaybeDecrTo(rejected, matchHint uint64) bool {
+
+	// 如果处于 StateReplicate 状态，则将 pr.Next 降低为 pr.Match + 1 ，以便去和 follower 的日志进行匹配。
 	if pr.State == StateReplicate {
 		// The rejection must be stale if the progress has matched and "rejected"
 		// is smaller than "match".
@@ -215,17 +225,21 @@ func (pr *Progress) MaybeDecrTo(rejected, matchHint uint64) bool {
 		// Directly decrease next to match + 1.
 		//
 		// TODO(tbg): why not use matchHint if it's larger?
+		//
+		// 复制状态(StateReplicate)下，将 pr.next 置为当前匹配位置 +1
 		pr.Next = pr.Match + 1
 		return true
 	}
 
 	// The rejection must be stale if "rejected" does not match next - 1. This
 	// is because non-replicating followers are probed one entry at a time.
-	if pr.Next-1 != rejected {
+	if pr.Next-1 != rejected { //出现过时的 MsgAppResp 消息直接忽略
 		return false
 	}
 
+	// 探测状态(StateProbe)下，则将 next 置为 follower 中最新的 index 和当前 index 中的最小值。
 	pr.Next = max(min(rejected, matchHint+1), 1)
+	// Next 重置完成，恢复消息发送，并在后面重新发送 MsgApp 消息
 	pr.MsgAppFlowPaused = false
 	return true
 }

@@ -41,18 +41,37 @@ import pb "go.etcd.io/raft/v3/raftpb"
 // 之后的日志你再以这个 snapshot 为基础进行应用，那我们的状态就可以同步了。
 //
 // 所以，unstable 的前半部分是快照数据，后半部分是日志条目组成的数组entries；
-// 另外， unstable.offset 成员保存的是 entries 数组中的第一条数据在 raft 日志中的索引，即第 i 条 entry 在 raft 日志中的索引为 i + unstable.offset。
+// 另外， unstable.offset 成员保存的是 entries 数组中的第一条数据在 raft 日志中的索引，
+// 即第 i 条 entry 在 raft 日志中的索引为 i + unstable.offset。
+//
+// 这两个部分，并不同时存在，同一时间只有一个部分存在。
+// 其中，快照数据仅当当前节点在接收从 leader 发送过来的快照数据时存在，在接收快照数据的时候，entries 数组中是没有数据的；
+// 除了这种情况之外，就只会存在 entries 数组的数据了。
+// 因此，当接收完毕快照数据进入正常的接收日志流程时，快照数据将被置空。
+//
+// 方法  描述
+//	maybeFirstIndex() (uint64, bool)	获取相对整个 raftLog 的 first index，当 unstable 无法得知该值时，第二个返回值返回 false 。
+//	maybeLastIndex() (uint64, bool)		获取相对整个 raftLog 的 last index，当 unstable 无法得知该值时，第二个返回值返回 false 。
+//	maybeTerm(i uint64) (uint64, bool)	获取给定 index 的日志条目的 term ，当 unstable 无法得知该值时，第二个返回值返回 false 。
+//	stableTo(i, t uint64)				通知 unstable 当前 index 为 i、term 为 t 及其之前的日志已经被保存到了稳定存储中，可以裁剪掉 unstable 中的这段日志了。裁剪后会根据空间利用率适当地对空间进行优化。
+//	stableSnapTo(i uint64)				通知 unstable 当前 index 在 i 及其之前的快照已经保存到了稳定存储中，如果 unstable 中保存了该快照，那么可以释放该快照了。
+//	restore(s pb.Snapshot)				根据快照恢复 unstable 的状态（设置 unstable 中的 offset、snapshot，并将 entries 置空）。
+//	truncateAndAppend(ents []pb.Entry)	对给定的日志切片进行裁剪，并将其加入到 unstable 保存的日志中。
+//	slice(lo uint64, hi uint64)			返回给定范围内的日志切片。首先会通过 mustCheckOutOfBounds(lo, hi uint64) 方法检查是否越界，如果越界会因此 panic 。
+//
 type unstable struct {
 	// the incoming unstable snapshot, if any.
-	// 快照数据，该快照数据也是未写入 Storage 中的 Entry 记录
+	// 快照数据，是 follower 从 leader 收到的最新的 Snapshot 。
+	// 该快照数据也是未写入 Storage 中的 Entry 记录
 	snapshot *pb.Snapshot
 
 	// all entries that have not yet been written to storage.
 	// 所有未被保存到 Storage 中的 Entry 记录
+	//
 	entries []pb.Entry
 
 	// entries[i] has raft log position i+offset.
-	// entries 中第一条记录的索引值newLogWithSize
+	// entries 中第一条记录的索引值
 	offset uint64
 
 	// if true, snapshot is being written to storage.
@@ -68,6 +87,9 @@ type unstable struct {
 
 // maybeFirstIndex returns the index of the first possible entry in entries
 // if it has a snapshot.
+//
+// 返回 unstable 数据的第一条数据索引。
+// 因为只有快照数据在最前面，因此这个函数只有当快照数据存在的时候才能拿到第一条数据索引，其他的情况下已经拿不到了。
 func (u *unstable) maybeFirstIndex() (uint64, bool) {
 	if u.snapshot != nil {
 		return u.snapshot.Metadata.Index + 1, true
@@ -77,6 +99,9 @@ func (u *unstable) maybeFirstIndex() (uint64, bool) {
 
 // maybeLastIndex returns the last index if it has at least one
 // unstable entry or snapshot.
+//
+// 返回最后一条数据的索引。
+// 因为是 entries 数据在后，而快照数据在前，所以取最后一条数据索引是从 entries 开始查，查不到的情况下才查快照数据。
 func (u *unstable) maybeLastIndex() (uint64, bool) {
 	if l := len(u.entries); l != 0 {
 		return u.offset + uint64(l) - 1, true
@@ -89,6 +114,10 @@ func (u *unstable) maybeLastIndex() (uint64, bool) {
 
 // maybeTerm returns the term of the entry at index i, if there
 // is any.
+//
+// 这个函数根据传入的日志数据索引，得到这个日志对应的任期号。
+// 前面已经提过，unstable.offset 是快照数据和 entries 数组的分界线，
+// 因此在这个函数中，会区分传入的参数与 offset 的大小关系，小于 offset 的情况下在快照数据中查询，否则就在 entries 数组中查询了。
 func (u *unstable) maybeTerm(i uint64) (uint64, bool) {
 	if i < u.offset {
 		if u.snapshot != nil && u.snapshot.Metadata.Index == i {
@@ -148,18 +177,25 @@ func (u *unstable) acceptInProgress() {
 // The method should only be called when the caller can attest that the entries
 // can not be overwritten by an in-progress log append. See the related comment
 // in newStorageAppendRespMsg.
+//
+// 该函数传入一个索引号 i 和任期号 t ，表示应用层已经将这个索引之前的数据进行持久化了，
+// 此时 unstable 要做的事情就是在自己的数据中查询，只有在满足任期号相同以及 i 大于等于 offset 的情况下，
+// 可以将 entries 中的数据进行缩容，将 i 之前的数据删除。
 func (u *unstable) stableTo(i, t uint64) {
+	// 尝试获取 i 的任期
 	gt, ok := u.maybeTerm(i)
 	if !ok {
 		// Unstable entry missing. Ignore.
 		u.logger.Infof("entry at index %d missing from unstable log; ignoring", i)
 		return
 	}
+
 	if i < u.offset {
 		// Index matched unstable snapshot, not unstable entry. Ignore.
 		u.logger.Infof("entry at index %d matched unstable snapshot; ignoring", i)
 		return
 	}
+
 	if gt != t {
 		// Term mismatch between unstable entry and specified entry. Ignore.
 		// This is possible if part or all of the unstable log was replaced
@@ -169,9 +205,10 @@ func (u *unstable) stableTo(i, t uint64) {
 			"entry at (%d,%d) in unstable log; ignoring", i, t, i, gt)
 		return
 	}
+
 	num := int(i + 1 - u.offset)
-	u.entries = u.entries[num:]
-	u.offset = i + 1
+	u.entries = u.entries[num:] // 缩减数组
+	u.offset = i + 1			// 更新已 stable 的最大 index
 	u.offsetInProgress = max(u.offsetInProgress, u.offset)
 	u.shrinkEntriesArray()
 }
@@ -211,6 +248,7 @@ func (u *unstable) restore(s pb.Snapshot) {
 }
 
 func (u *unstable) truncateAndAppend(ents []pb.Entry) {
+	// ents[0] 是这批 entries 的第一个消息，所以它的 Index 最小
 	fromIndex := ents[0].Index
 	switch {
 	case fromIndex == u.offset+uint64(len(u.entries)):
@@ -243,6 +281,7 @@ func (u *unstable) truncateAndAppend(ents []pb.Entry) {
 // the way to the application code through Ready struct. Protect other slices
 // similarly, and document how the client can use them.
 func (u *unstable) slice(lo uint64, hi uint64) []pb.Entry {
+	// 判断 lo,hi 是否超过 u.entries 范围
 	u.mustCheckOutOfBounds(lo, hi)
 	// NB: use the full slice expression to limit what the caller can do with the
 	// returned slice. For example, an append will reallocate and copy this slice

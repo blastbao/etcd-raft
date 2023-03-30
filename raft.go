@@ -605,6 +605,12 @@ func (r *raft) send(m pb.Message) {
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer.
+//
+// sendAppend 向特定的 Follower（由传入参数的 to 代表）发送日志同步命令。
+// 该方法首先会找到该 Follower 上一次已同步的日志位置(pr.Next-1)，然后从 raftLog 中获取该位置以后的日志项进行同步；
+// 当然，每次同步的数量不宜太多，由 maxMsgSize 限制。
+// 当然，如果无法从 raftLog 获取到想要的日志项，此时需要考虑发送 Snapshot ，
+// 这是因为对应的日志项可能由于已经被 commit 而丢弃了（向新加入节点同步日志的时候可能会出现这种情况）
 func (r *raft) sendAppend(to uint64) {
 	r.maybeSendAppend(to, true)
 }
@@ -614,15 +620,31 @@ func (r *raft) sendAppend(to uint64) {
 // argument controls whether messages with no entries will be sent
 // ("empty" messages are useful to convey updated Commit indexes, but
 // are undesirable when we're sending multiple messages in a batch).
+//
+//
 func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
+	// 目标节点 to 的信息
 	pr := r.prs.Progress[to]
+	// 检测当前节点是否可以向目标节点发送消息
 	if pr.IsPaused() {
 		return false
 	}
 
+	// [重要]
+	//
+	// pr.Next 表示要发给该 follower 的下一条日志的索引，pr.Next－1 表示上一次发给该 follower 的日志，
+	//
+	// 因此
+	//
+	// r.raftLog.term(pr.Next - 1) 表示上次发给该 follower 的日志的任期号，
+	// r.raftLog.entries(pr.Next, r.maxMsgSize) 表示从 leader 日志中取出要发给该 follower 的日志条目
+
+
+	// 上一次发送给该 follower 的日志索引、日志期号，下一次待发送的日志索引
 	lastIndex, nextIndex := pr.Next-1, pr.Next
 	lastTerm, errt := r.raftLog.term(lastIndex)
 
+	// 取出待发送的日志条目
 	var ents []pb.Entry
 	var erre error
 	// In a throttled StateReplicate only send empty MsgApp, to ensure progress.
@@ -639,13 +661,19 @@ func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 		return false
 	}
 
+	// [重要][快照]
+	// 对于一个 Follower ，如果需要同步给它的日志已经被回收了，那就直接发送 Snapshot 消息（MsgSnap）给该 Follower 。
 	if errt != nil || erre != nil { // send snapshot if we failed to get term or entries
+
+		// 如果该节点已经不存活，则无需发送
 		if !pr.RecentActive {
 			r.logger.Debugf("ignore sending snapshot to %x since it is not recently active", to)
 			return false
 		}
 
+		// 拿到当前的 snapshot 信息
 		snapshot, err := r.raftLog.snapshot()
+		// 如果获取快照异常，则终止整个程序
 		if err != nil {
 			if err == ErrSnapshotTemporarilyUnavailable {
 				r.logger.Debugf("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
@@ -653,16 +681,19 @@ func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 			}
 			panic(err) // TODO(bdarnell)
 		}
+
+
 		if IsEmptySnap(snapshot) {
 			panic("need non-empty snapshot")
 		}
 		sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
-		r.logger.Debugf("%x [firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%s]",
-			r.id, r.raftLog.firstIndex(), r.raftLog.committed, sindex, sterm, to, pr)
+		r.logger.Debugf("%x [firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%s]", r.id, r.raftLog.firstIndex(), r.raftLog.committed, sindex, sterm, to, pr)
 		pr.BecomeSnapshot(sindex)
 		r.logger.Debugf("%x paused sending replication messages to %x [%s]", r.id, to, pr)
 
+		// 发送 snapshot 信息给节点
 		r.send(pb.Message{To: to, Type: pb.MsgSnap, Snapshot: &snapshot})
+		// 发送成功
 		return true
 	}
 
@@ -670,15 +701,17 @@ func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 	if err := pr.UpdateOnEntriesSend(len(ents), uint64(payloadsSize(ents)), nextIndex); err != nil {
 		r.logger.Panicf("%x: %v", r.id, err)
 	}
+
 	// NB: pr has been updated, but we make sure to only use its old values below.
 	r.send(pb.Message{
-		To:      to,
-		Type:    pb.MsgApp,
-		Index:   lastIndex,
-		LogTerm: lastTerm,
-		Entries: ents,
-		Commit:  r.raftLog.committed,
+		To:      to,		// 目标节点
+		Type:    pb.MsgApp, // 消息类型：附加日志消息
+		Index:   lastIndex,	// 上一次发送给该 follower 的日志索引
+		LogTerm: lastTerm,	// 上一次发送给该 follower 的日志的任期号
+		Entries: ents,		// 要发送的日志条目
+		Commit:  r.raftLog.committed,	// leader的日志提交位置
 	})
+
 	return true
 }
 
@@ -1396,7 +1429,6 @@ func stepLeader(r *raft, m pb.Message) error {
 			return ErrProposalDropped
 		}
 
-
 		r.bcastAppend()
 		return nil
 	case pb.MsgReadIndex:
@@ -1420,6 +1452,7 @@ func stepLeader(r *raft, m pb.Message) error {
 		return nil
 	}
 
+
 	// All other message types require a progress for m.From (pr).
 	pr := r.prs.Progress[m.From]
 	if pr == nil {
@@ -1431,8 +1464,10 @@ func stepLeader(r *raft, m pb.Message) error {
 		// NB: this code path is also hit from (*raft).advance, where the leader steps
 		// an MsgAppResp to acknowledge the appended entries in the last Ready.
 
+		// 收到节点的 MsgAppResp 消息，说明该节点是活跃的，因此保存节点状态的 RecentActive 成员置为 true 。
 		pr.RecentActive = true
 
+		// 节点拒绝了前面的 MsgApp/MsgSnap 消息
 		if m.Reject {
 			// RejectHint is the suggested next base entry for appending (i.e.
 			// we try to append entry RejectHint+1 next), and LogTerm is the
@@ -1456,6 +1491,13 @@ func stepLeader(r *raft, m pb.Message) error {
 			// described below.
 			r.logger.Debugf("%x received MsgAppResp(rejected, hint: (index %d, term %d)) from %x for index %d",
 				r.id, m.RejectHint, m.LogTerm, m.From, m.Index)
+
+			// 根据 MsgAppResp 消息携带的 msg.RejectHint 信息回退 leader 上保存的关于该节点的日志记录状态。
+			//
+			// [重要]
+			// 比如 leader 前面认为从日志索引为 10 的位置开始向节点 A 同步数据，但是节点 A 拒绝了这次数据同步，同时返回 RejectHint 为 2 ，
+			// 说明节点 A 告知 leader 在它上面保存的最大日志索引 ID 为 2 ，这样下一次 leader 就可以直接从索引为 2 的日志数据开始同步数据到节点 A 。
+			// 而如果没有这个 RejectHint 成员，leader 只能在每次被拒绝数据同步后都递减 1 进行下一次数据同步，显然这样是低效的。
 			nextProbeIdx := m.RejectHint
 			if m.LogTerm > 0 {
 				// If the follower has an uncommitted log tail, we would end up
@@ -1554,18 +1596,38 @@ func stepLeader(r *raft, m pb.Message) error {
 				//    log.
 				nextProbeIdx, _ = r.raftLog.findConflictByTerm(m.RejectHint, m.LogTerm)
 			}
+
+			// 当 leader 收到附加日志拒绝消息时，说明 p.Next 太大了，
+			// 导致 leader 在 p.Next-1 位置的日志没有与 follower 匹配上，需要将 pr.Next 降低为 pr.Match+1 ，
+			// 然后转变为 StateProbe 状态，去探测 follower 与 leader 的日志匹配位置。
+
 			if pr.MaybeDecrTo(m.Index, nextProbeIdx) {
 				r.logger.Debugf("%x decreased progress of %x to [%s]", r.id, m.From, pr)
+				// 如果对应的 Progress 处于 StateReplicate 状态，则切换成 StateProbe 状态，试探 Follower 的匹配位置；
+				// 这里的试探是指发送一条消息并等待其相应之后，再发送后续的消息。
 				if pr.State == tracker.StateReplicate {
 					pr.BecomeProbe()
 				}
+				// 再次向对应 Follower 节点发送 MsgApp 消息，在 sendAppend() 方法中会将对应的 Progress.pause 字段设立为 true ，
+				// 从而暂停后续消息的发送，从而实现前面说的“试探”的效果。
 				r.sendAppend(m.From)
 			}
+
 		} else {
+
+			// 当 leader 收到 Append 日志成功消息时，则要更新 pr.Match 和 pr.Next ，
+			// m.Index 是 follower 的最新日志位置，要设置 pr.Match=m.Index, pr.Next=m.Index+1 。
+			// 每次 Append 日志成功，就尝试提交下可以提交的日志(r.maybeCommit())，
+			// 如果日志复制到了过半数 server ，说明可以提交了，便向其他 follower 发送日志提交请求(r.bcastAppend())
+
 			oldPaused := pr.IsPaused()
+			// MsgAppResp 消息的 Index 字段是对应 Follower 节点 raftLog 中最后一条 Entry 记录的索引，
+			// 这里会根据该值更新其对应 Progress 实例的 Match 和 Next。
 			if pr.MaybeUpdate(m.Index) {
 				switch {
 				case pr.State == tracker.StateProbe:
+					// 一旦 MsgApp 被 Follower 节点接收，则表示已经找到其正确的 Next 和 Match ，不必再进行“试探”，
+					// 这里将对应的 Progress.state 切换成 StateReplicate 。
 					pr.BecomeReplicate()
 				case pr.State == tracker.StateSnapshot && pr.Match >= pr.PendingSnapshot:
 					// TODO(tbg): we should also enter this branch if a snapshot is
@@ -1580,19 +1642,33 @@ func stepLeader(r *raft, m pb.Message) error {
 					pr.BecomeProbe()
 					pr.BecomeReplicate()
 				case pr.State == tracker.StateReplicate:
+					// 之前向某个 Follower 节点发送 MsgApp 消息时，会将其相关信息保存到对应的 Progress.ins 中，
+					// 在这里收到相应的 MsgAppResp 响应之后，会将其从 ins 中删除，这样可以实现了限流的效采，
+					// 避免网络出现延迟时继续发送消息，从而导致网络更加拥堵。
 					pr.Inflights.FreeLE(m.Index)
 				}
 
+
+				// 本地提交：
+				// 收到一个 Follower 节点的 MsgAppResp 消息之后，除了修改相应的 Match 和 Next ，还会尝试更新 raftLog.committed ，
+				// 因为有些 Entry 记录可能在此次复制中被保存到了半数以上的节点中。
 				if r.maybeCommit() {
 					// committed index has progressed for the term, so it is safe
 					// to respond to pending read index requests
+					//
+					//
 					releasePendingReadIndexMessages(r)
+					// 集群提交：向所有节点发送 MsgApp 消息，注意，此次 MsgApp 消息的 Commit 字段与上次 MsgApp 消息已经不同
 					r.bcastAppend()
-				} else if oldPaused {
+				} else if oldPaused { // 之前是 pause 状态，现在可以任性地发消息了
 					// If we were paused before, this node may be missing the
 					// latest commit index, so send it.
+					//
+					// 之前 Leader 节点暂停向该 Follower 节点发送消息，收到 MsgAppResp 消息后，
+					// 在上述代码中已经重立了相应状态，所以可以继续发送 MsgApp 消息
 					r.sendAppend(m.From)
 				}
+
 				// We've updated flow control information above, which may
 				// allow us to send multiple (size-limited) in-flight messages
 				// at once (such as when transitioning from probe to
@@ -1610,14 +1686,18 @@ func stepLeader(r *raft, m pb.Message) error {
 				}
 			}
 		}
+
 	case pb.MsgHeartbeatResp:
-		pr.RecentActive = true
-		pr.MsgAppFlowPaused = false
+		pr.RecentActive = true // 对端仍旧活跃
+		pr.MsgAppFlowPaused = false	//
 
 		// NB: if the follower is paused (full Inflights), this will still send an
 		// empty append, allowing it to recover from situations in which all the
 		// messages that filled up Inflights in the first place were dropped. Note
 		// also that the outgoing heartbeat already communicated the commit index.
+		//
+		// 比较该 follower 与 leader 日志的匹配位置 pr.Match 与 leader 日志的最新位置，
+		// 如果两个位置不相等，说明还有日志需要发送给该 follower ，最终使得该 follower 的日志追上 leader 的日志。
 		if pr.Match < r.raftLog.lastIndex() {
 			r.sendAppend(m.From)
 		}
@@ -1844,14 +1924,28 @@ func stepFollower(r *raft, m pb.Message) error {
 }
 
 func (r *raft) handleAppendEntries(m pb.Message) {
+
+	// m.Index 表示 leader 发送给 follower 的上一条日志的索引位置，
+	// 如果当前 follower 在 Index 位置的日志已经提交过了(有可能该 leader 是刚选举产生的，没有 follower 的日志信息，所以设置 m.Index=0 )，
+	// 则不能进行追加操作，在前面在 Raft 协议时捉到过，己提交的记录不能被覆盖，
+	// 所以 Follower 节点会将其 committed 位置通过 MsgAppResp 消息（ Index 字段）通知 Leader 节点，
+	// 让 leader 从该 follower 的 committed 位置的下一条位置的日志开始发送给 follower 。
 	if m.Index < r.raftLog.committed {
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
 		return
 	}
+
+	// 尝试将消息携带的 Entry 记录追加到 raftLog 中，可能存在冲突，因此需要先找到冲突的位置，然后用 leader 发送来的日志中从冲突位置开始覆盖 follower 的日志。
 	if mlastIndex, ok := r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
+		// 如追加成功，则将最后一条记录的索引位(mlastIndex)通过 MsgAppResp 消息返回给 Leader 节点，
+		// 这样 Leader 节点就可以根据此值更新其对应的 Next 和 Match 值。
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
 		return
 	}
+
+	// 如采追加记录失败，则将失败信息返回给 Leader 节点（即 MsgAppResp 消息的 Reject 字段为 true )，
+	// 同时返回的还有一些提示信息（ RejectHint 字段保存了当前节点 raftLog 中最后一条记录的索引）
+
 	r.logger.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",
 		r.id, r.raftLog.zeroTermOnOutOfBounds(r.raftLog.term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
 
@@ -1873,12 +1967,15 @@ func (r *raft) handleAppendEntries(m pb.Message) {
 	// LogTerm in this response in any case, so we don't verify it here.
 	hintIndex := min(m.Index, r.raftLog.lastIndex())
 	hintIndex, hintTerm := r.raftLog.findConflictByTerm(hintIndex, m.LogTerm)
+
+	// 如果 leader 与 follower 的日志还没有匹配上，那么把 follower 的最新日志的索引位置告诉 leader ，
+	// 以便 leader 下一次从该 follower 的最新日志位置之后开始尝试发送附加日志，直到 leader 与 follower 的日志匹配上了就能追加日志成功了。
 	r.send(pb.Message{
 		To:         m.From,
 		Type:       pb.MsgAppResp,
 		Index:      m.Index,
-		Reject:     true,
-		RejectHint: hintIndex,
+		Reject:     true,		// 拒绝
+		RejectHint: hintIndex,	// follower 的最新日志的索引
 		LogTerm:    hintTerm,
 	})
 }
@@ -1888,6 +1985,22 @@ func (r *raft) handleHeartbeat(m pb.Message) {
 	r.send(pb.Message{To: m.From, Type: pb.MsgHeartbeatResp, Context: m.Context})
 }
 
+
+
+//
+//
+// 对于 Follower 节点：
+//
+// 如果本地日志已经包含了 snapshot 中的日志，那么就什么都不用做了，直接提交即可；
+// 否则，将内存中的日志项清空，并将 Leader 发过来的 snapshot 存储在内存日志结构中（参见 raftLog.restore() ）。
+// 同时，snapshot 记录了彼时刻的集群配置信息，既然要恢复成 snapshot 时的状态，也必须得按照该集群配置去重构本地的节点拓扑。
+//
+// 与节点自身主动进行的 snapshot 过程所不同的是，Follower 节点被动接受的 Leader 复制的 snapshot 后，需要将该 snapshot 更新至当前节点的应用状态机。
+//
+// Follower 节点接收并存储了 Leader 复制而来的 snapshot 后，更新应用状态的大致的过程是：
+//	Follower 节点的 raft 内部状态机会将 unstable log 中的 snapshot 信息放在 Ready 结构中，
+//	应用通过 Ready() 接口获取到 snapshot 信息，然后在内存中重放：
+
 func (r *raft) handleSnapshot(m pb.Message) {
 	// MsgSnap messages should always carry a non-nil Snapshot, but err on the
 	// side of safety and treat a nil Snapshot as a zero-valued Snapshot.
@@ -1895,6 +2008,7 @@ func (r *raft) handleSnapshot(m pb.Message) {
 	if m.Snapshot != nil {
 		s = *m.Snapshot
 	}
+
 	sindex, sterm := s.Metadata.Index, s.Metadata.Term
 
 	// 将快照存在 raftLog 的 unstable 结构中, 会由 node.run 方法基于 Ready 拿到当前的快照数据
@@ -1967,7 +2081,7 @@ func (r *raft) restore(s pb.Snapshot) bool {
 	}
 
 	// Now go ahead and actually restore.
-
+	// 如果本地的 raft log 已经包含了 Snapshot 的日志项，那直接提交即可，什么都不用做
 	if r.raftLog.matchTerm(s.Metadata.Index, s.Metadata.Term) {
 		r.logger.Infof("%x [commit: %d, lastindex: %d, lastterm: %d] fast-forwarded commit to snapshot [index: %d, term: %d]",
 			r.id, r.raftLog.committed, r.raftLog.lastIndex(), r.raftLog.lastTerm(), s.Metadata.Index, s.Metadata.Term)
@@ -1975,6 +2089,7 @@ func (r *raft) restore(s pb.Snapshot) bool {
 		return false
 	}
 
+	// 恢复内存日志项(其实主要是 unstable )为空，并记录下 snapshot 信息
 	r.raftLog.restore(s)
 
 	// Reset the configuration and add the (potentially updated) peers in anew.

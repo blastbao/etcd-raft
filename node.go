@@ -37,6 +37,8 @@ var (
 
 // SoftState provides state that is useful for logging and debugging.
 // The state is volatile and does not need to be persisted to the WAL.
+//
+// SoftState 指易变的状态数据，记录了当前的 Leader 的 Node ID ，以及当前节点的角色。
 type SoftState struct {
 	Lead      uint64 // must use atomic operations to access; keep 64-bit aligned.
 	RaftState StateType

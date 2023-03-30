@@ -144,23 +144,27 @@ func (l *raftLog) String() string {
 // maybeAppend returns (0, false) if the entries cannot be appended. Otherwise,
 // it returns (last index of new entries, true).
 func (l *raftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry) (lastnewi uint64, ok bool) {
+	// 查看 index 的 term 与 logTerm 是否匹配
 	if !l.matchTerm(index, logTerm) {
 		return 0, false
 	}
 
 	lastnewi = index + uint64(len(ents))
+
+	// 查找 entries 中，index 与 term 冲突的位置
 	ci := l.findConflict(ents)
 	switch {
-	case ci == 0:
-	case ci <= l.committed:
+	case ci == 0:// 没有冲突，全部追加
+	case ci <= l.committed:// 如果冲突的位置在已提交的位置之前，报错
 		l.logger.Panicf("entry %d conflict with committed entry [committed(%d)]", ci, l.committed)
-	default:
+	default: // 如果冲突的位置在提交位置之后，部分追加
 		offset := index + 1
 		if ci-offset > uint64(len(ents)) {
 			l.logger.Panicf("index, %d, is out of range [%d]", ci-offset, len(ents))
 		}
 		l.append(ents[ci-offset:]...)
 	}
+
 	l.commitTo(min(committed, lastnewi))
 	return lastnewi, true
 }

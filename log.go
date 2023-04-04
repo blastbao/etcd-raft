@@ -358,16 +358,15 @@ func (l *raftLog) firstIndex() uint64 {
 }
 
 func (l *raftLog) lastIndex() uint64 {
-
+	//
 	if i, ok := l.unstable.maybeLastIndex(); ok {
 		return i
 	}
-
+	//
 	i, err := l.storage.LastIndex()
 	if err != nil {
 		panic(err) // TODO(bdarnell)
 	}
-
 	return i
 }
 

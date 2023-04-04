@@ -89,7 +89,8 @@ type Ready struct {
 	// on immediately. It will be reflected in a MsgStorageAppend message in the
 	// Messages slice.
 	//
-	// 包含当前节点见过的最大的 term ，以及在这个 term 给谁投过票，以及当前节点知道的 commit index ，这部分数据会持久化
+	// 包含了持久化的状态，在消息发送给其它节点前需要保存到磁盘；
+	// 它包含当前节点见过的最大的 term ，以及在这个 term 给谁投过票，以及当前节点知道的 commit index 。
 	pb.HardState
 
 	// ReadStates can be used for node to serve linearizable read requests locally
@@ -106,6 +107,8 @@ type Ready struct {
 	// If async storage writes are enabled, this field does not need to be acted
 	// on immediately. It will be reflected in a MsgStorageAppend message in the
 	// Messages slice.
+	//
+	// 表示在发送其它节点之前需要被持久化的状态数据
 	Entries []pb.Entry
 
 	// Snapshot specifies the snapshot to be saved to stable storage.
@@ -391,7 +394,6 @@ func (n *node) run() {
 	lead := None
 
 	for {
-
 		// 1. 轮询时，首先将新产生的 Ready 取出来存入 rd 中，同时设置 readyc 管道
 		if advancec == nil && n.rn.HasReady() {
 			// Populate a Ready. Note that this Ready is not guaranteed to
@@ -410,9 +412,8 @@ func (n *node) run() {
 			readyc = n.readyc
 		}
 
-		// 2. 探测 Leader 变化并打日志，仅当集群中存在
+		// 2. 探测 Leader 变化并打日志，仅当集群中存在 leader 时才会处理提案。
 		if lead != r.lead {
-			// 知道 leader 是谁后就可以通过 propc 读取数据，否则不处理。
 			if r.hasLeader() {
 				if lead == None {
 					r.logger.Infof("raft.node: %x elected leader %x at term %d", r.id, r.lead, r.Term)
@@ -424,8 +425,7 @@ func (n *node) run() {
 				r.logger.Infof("raft.node: %x lost leader %x at term %d", r.id, lead, r.Term)
 				propc = nil
 			}
-			// 保存当前 leader
-			lead = r.lead
+			lead = r.lead // 保存当前 leader
 		}
 
 		// 3. 监听通道以进行处理
@@ -488,7 +488,10 @@ func (n *node) run() {
 			case n.confstatec <- cs:
 			case <-n.done:
 			}
-		case <-n.tickc:// 外部对 Node 调用 Tick 时，这里会收到，并自增 tick 计数器
+
+		// [重要]
+		// 定期触发 Tick 滴答时钟，从而触发发送心跳和选举。etcd raft 是通过滴答时钟往前推进的。
+		case <-n.tickc:
 			n.rn.Tick()
 		// 将新取出来的 Ready 放入 ready 通道中，供上层对 Node 调用 Ready() 获取并处理。
 		case readyc <- rd:
@@ -620,6 +623,17 @@ func (n *node) stepWithWaitOption(ctx context.Context, m pb.Message, wait bool) 
 
 	return nil
 }
+
+// [重要]
+//
+// 库的使用者从 node 结构体提供的一个 ready channel 中不断的 pop 出一个个的 Ready 进行处理，
+//
+// 需要对 Ready 的处理包括:
+//	将 HardState, Entries, Snapshot 持久化到 storage 。
+//	将 Messages(上文提到的msgs)非阻塞的广播给其他 peers 。
+//	将 CommittedEntries(已经commit还没有apply) 应用到状态机。
+//	如果发现 CommittedEntries 中有成员变更类型的 entry ，调用 node 的 ApplyConfChange() 方法让 node 知道(这里和raft论文不一样，论文中只要节点收到了成员变更日志就应用)
+//	调用 Node.Advance() 告诉 raft node ，这批状态更新处理完了，状态已经演进了，可以给我下一批 Ready 让我处理。
 
 func (n *node) Ready() <-chan Ready { return n.readyc }
 

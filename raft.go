@@ -952,7 +952,6 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
 //	成为leader的同时，leader 将发送一条 dummy 的 append 消息，目的是为了提交该节点上在此任期之前的值（见疑问部分如何提交之前任期的值）
 //
 func (r *raft) tickElection() {
-
 	// 将选举超时递增 1 。
 	r.electionElapsed++
 	// 若节点可以成为 Leader ，且超时，则会给自己发送 MsgHup 消息，表示触发选主
@@ -1507,6 +1506,7 @@ func stepLeader(r *raft, m pb.Message) error {
 			}
 			// 2. 判断是否需要拒绝配置变更
 			if cc != nil {
+				// 对于 leader 来说，alreadyPending 来保证同一时刻仅有一个成员变更请求
 				alreadyPending := r.pendingConfIndex > r.raftLog.applied // 上次变更是否应用
 				alreadyJoint := len(r.prs.Config.Voters[1]) > 0 // 是否在 Joint Consensus 阶段(V2)
 				wantsLeaveJoint := len(cc.AsV2().Changes) == 0 // 是否需要离开 Joint Consensus (V2)

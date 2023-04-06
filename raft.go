@@ -1812,7 +1812,9 @@ func stepLeader(r *raft, m pb.Message) error {
 			r.sendAppend(m.From)
 		}
 
-		// 处理 readOnly ，这里忽略
+		// [readOnly]
+		// leader 在接收到 MsgHeartbeatResp 消息后，如果其中有 ctx 字段，说明该 MsgHeartbeatResp 消息对应的 MsgHeartbeat 消息，
+		// 是收到 ReadIndex 时 leader 消息为了确认自己还是集群 leader 发送的心跳消息。
 		if r.readOnly.option != ReadOnlySafe || len(m.Context) == 0 {
 			return nil
 		}

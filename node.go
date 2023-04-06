@@ -448,16 +448,19 @@ func (n *node) run() {
 			}
 		//
 		case m := <-n.recvc: // 这里会收到并处理响应消息
-			// 相比于 propc 中的数据处理，多了一些判断
+			// 过滤
 			if IsResponseMsg(m.Type) && !IsLocalMsgTarget(m.From) && r.prs.Progress[m.From] == nil {
 				// Filter out response message from unknown From.
 				break
 			}
+			// 处理消息
 			r.Step(m)
 		// 配置修改处理
 		case cc := <-n.confc: // 外部对 Node 调用 ProposeConfChange 时，这里会收到，处理集群配置变更
+
 			_, okBefore := r.prs.Progress[r.id]
 			cs := r.applyConfChange(cc)
+
 			// If the node was removed, block incoming proposals. Note that we
 			// only do this if the node was in the config before. Nodes may be
 			// a member of the group without knowing this (when they're catching

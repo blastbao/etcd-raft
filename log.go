@@ -23,10 +23,10 @@ import (
 
 // raftLog 由以下成员组成：
 //
-//	- storage Storage：持久化存储 —— 存放已经持久化数据的 Storage 接口。
-//	- unstable unstable：非持久化存储 —— 用于保存应用层还没有持久化的数据。
-//	- committed uint64：保存当前提交的日志数据索引。
-//	- applied uint64：保存当前传入状态机的数据最高索引。
+//   - storage Storage：持久化存储 —— 存放已经持久化数据的 Storage 接口。
+//   - unstable unstable：非持久化存储 —— 用于保存应用层还没有持久化的数据。
+//   - committed uint64：保存当前提交的日志数据索引。
+//   - applied uint64：保存当前传入状态机的数据最高索引。
 //
 // 一条日志数据，首先需要被提交（committed）成功，然后才能被应用（applied）到状态机中。
 // 因此，以下不等式一直成立：applied <= committed。
@@ -59,7 +59,6 @@ type raftLog struct {
 	// 正在应用
 	applying uint64
 
-
 	// applied is the highest log position that the application has
 	// successfully applied to its state machine.
 	// Use: The field is incremented when advancing after the committed
@@ -86,7 +85,6 @@ type raftLog struct {
 	// applyingEntsPaused is true when entry application has been paused until
 	// enough progress is acknowledged.
 	applyingEntsPaused bool
-
 }
 
 // newLog returns log using the given storage and default options. It
@@ -159,8 +157,8 @@ func (l *raftLog) maybeAppend(index, logTerm, committed uint64, ents ...pb.Entry
 	// 2. 若匹配，则先寻找冲突项，正常情况下，冲突项的索引会大于自己的 committed
 	ci := l.findConflict(ents)
 	switch {
-	case ci == 0:// 没有冲突，全部追加
-	case ci <= l.committed:// 如果冲突的位置在已提交的位置之前，报错
+	case ci == 0: // 没有冲突，全部追加
+	case ci <= l.committed: // 如果冲突的位置在已提交的位置之前，报错
 		l.logger.Panicf("entry %d conflict with committed entry [committed(%d)]", ci, l.committed)
 	default:
 		// 3. 追加剩余的日志，这里会把原日志的冲突项之后的一并删除，并用新的日志项追加和替代
@@ -488,9 +486,6 @@ func (l *raftLog) allEntries() []pb.Entry {
 // later term is more up-to-date. If the logs end with the same term, then
 // whichever log has the larger lastIndex is more up-to-date. If the logs are
 // the same, the given log is up-to-date.
-//
-//
-//
 func (l *raftLog) isUpToDate(lasti, term uint64) bool {
 	return term > l.lastTerm() || (term == l.lastTerm() && lasti >= l.lastIndex())
 }

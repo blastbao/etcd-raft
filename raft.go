@@ -1356,13 +1356,11 @@ func (r *raft) Step(m pb.Message) error {
 		}
 
 	case pb.MsgVote, pb.MsgPreVote:
-
 		// 当前节点在参与预选时，会综合下面几个条件决定是否投票
 		//   1. 当前节点是否已经投票
 		//   2. MsgPreVote 消息发送者的任期号是否更大
 		//   3. 当前节点投票给了对方节点
 		//   4. MsgPreVote 消息发送者的 raftLog 中是否包含当前节点的全部 Entry 记录
-
 
 		// We can vote if this is a repeat of a vote we've already cast...
 		// 再次收到一个已经投票给它的节点的投票请求
